@@ -8,8 +8,11 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import axios from 'axios';
-import dotenv from 'dotenv';
-import crypto from 'crypto';
+import dotenv from "dotenv";
+import crypto from "crypto";
+
+// Add a modest request timeout to avoid hanging tool calls
+const DEFAULT_HTTP_TIMEOUT_MS = 30000;
 
 // Redirect all console output to stderr
 const originalConsole = { ...console };
@@ -22,6 +25,7 @@ dotenv.config();
 const GONG_API_URL = 'https://api.gong.io/v2';
 const GONG_ACCESS_KEY = process.env.GONG_ACCESS_KEY;
 const GONG_ACCESS_SECRET = process.env.GONG_ACCESS_SECRET;
+const GONG_USER_FULL_NAME = process.env.GONG_USER_FULL_NAME; // Used for default user resolution
 
 // Check for required environment variables
 if (!GONG_ACCESS_KEY || !GONG_ACCESS_SECRET) {
@@ -53,12 +57,39 @@ interface GongTranscript {
   }>;
 }
 
+interface GongUser {
+  id: string;
+  name?: string; // legacy
+  fullName?: string; // legacy
+  firstName?: string;
+  lastName?: string;
+  email?: string; // legacy
+  emailAddress?: string;
+}
+
 interface GongListCallsResponse {
   calls: GongCall[];
 }
 
 interface GongRetrieveTranscriptsResponse {
   transcripts: GongTranscript[];
+}
+
+interface GongListCallsExtensiveResponse {
+  records?: {
+    totalRecords?: number;
+    currentPageSize?: number;
+    currentPageNumber?: number;
+    cursor?: string;
+  };
+  calls?: Array<Record<string, unknown>>;
+}
+
+interface GongUsersResponse {
+  records?: {
+    cursor?: string;
+  };
+  users?: GongUser[];
 }
 
 interface GongListCallsArgs {
@@ -68,7 +99,16 @@ interface GongListCallsArgs {
 }
 
 interface GongRetrieveTranscriptsArgs {
-  callIds: string[];
+  callIds: string[] | string;
+}
+
+interface GongListCallsExtensiveArgs {
+  start_date?: string;
+  end_date?: string;
+  user_id?: string;
+  user_ids?: string[];
+  userIds?: string[];
+  text?: string;
 }
 
 // Gong API Client
@@ -119,7 +159,8 @@ class GongClient {
         'X-Gong-AccessKey': this.accessKey,
         'X-Gong-Timestamp': timestamp,
         'X-Gong-Signature': await this.generateSignature(method, path, timestamp, data || params)
-      }
+      },
+      timeout: DEFAULT_HTTP_TIMEOUT_MS
     });
 
     return response.data as T;
@@ -143,9 +184,61 @@ class GongClient {
       }
     });
   }
+
+  async listCallsExtensive(filter: Record<string, unknown>, cursor?: string): Promise<GongListCallsExtensiveResponse> {
+    const payload: Record<string, unknown> = { filter };
+    if (cursor) {
+      payload.cursor = cursor;
+    }
+    return this.request<GongListCallsExtensiveResponse>('POST', '/calls/extensive', undefined, payload);
+  }
+
+  async getUsers(cursor?: string, includeAvatars = false): Promise<GongUsersResponse> {
+    const params: Record<string, string> = {};
+    if (cursor) params.cursor = cursor;
+    if (includeAvatars) params.includeAvatars = "true";
+    return this.request<GongUsersResponse>('GET', '/users', params);
+  }
 }
 
 const gongClient = new GongClient(GONG_ACCESS_KEY, GONG_ACCESS_SECRET);
+
+// Cache the resolved user id for the configured full name
+let cachedUserId: string | null = null;
+async function getOrResolveMyUserId(): Promise<string> {
+  if (cachedUserId) return cachedUserId;
+  if (!GONG_USER_FULL_NAME) {
+    throw new Error("GONG_USER_FULL_NAME is not set; unable to resolve default user.");
+  }
+
+  let cursor: string | undefined;
+  const matches: GongUser[] = [];
+  do {
+    const resp = await gongClient.getUsers(cursor);
+      const users = resp.users ?? [];
+      for (const u of users) {
+        const composite = `${u.firstName || ""} ${u.lastName || ""}`.trim();
+        const candidateName = (composite || u.fullName || u.name || "").trim().toLowerCase();
+        if (!candidateName) continue;
+        if (candidateName === GONG_USER_FULL_NAME.trim().toLowerCase()) {
+          matches.push(u);
+        }
+      }
+    cursor = resp.records?.cursor;
+  } while (cursor);
+
+  if (matches.length === 0) {
+    throw new Error(`No Gong user matched configured full name '${GONG_USER_FULL_NAME}'.`);
+  }
+
+  // Deterministic pick: lowest lexical id if multiple matches
+  matches.sort((a, b) => (a.id || "").localeCompare(b.id || ""));
+  cachedUserId = matches[0].id;
+  if (!cachedUserId) {
+    throw new Error("Matched user has no id field; cannot proceed.");
+  }
+  return cachedUserId;
+}
 
 // Tool definitions
 const LIST_CALLS_TOOL: Tool = {
@@ -173,12 +266,54 @@ const RETRIEVE_TRANSCRIPTS_TOOL: Tool = {
     type: "object",
     properties: {
       callIds: {
-        type: "array",
-        items: { type: "string" },
-        description: "Array of Gong call IDs to retrieve transcripts for"
+        anyOf: [
+          {
+            type: "array",
+            items: { type: "string" }
+          },
+          {
+            type: "string"
+          }
+        ],
+        description: "A Gong call ID or array of Gong call IDs to retrieve transcripts for"
       }
     },
     required: ["callIds"]
+  }
+};
+
+const LIST_CALLS_EXTENSIVE_TOOL: Tool = {
+  name: "list_calls_extensive",
+  description: "List detailed Gong calls via /v2/calls/extensive with optional date range, user filter, and text filter. Defaults to the configured GONG_USER_FULL_NAME when userIds are not provided.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      start_date: { type: "string", description: "Start date/time ISO (fromDateTime filter)" },
+      end_date: { type: "string", description: "End date/time ISO (toDateTime filter)" },
+      user_id: { type: "string", description: "Single Gong user id to filter host/owner" },
+      user_ids: {
+        type: "array",
+        items: { type: "string" },
+        description: "Array of Gong user ids; overrides default user resolution"
+      },
+      userIds: {
+        type: "array",
+        items: { type: "string" },
+        description: "Alias for user_ids"
+      },
+      text: { type: "string", description: "Optional text/customer filter supported by Gong" }
+    }
+  }
+};
+
+const GET_USERS_TOOL: Tool = {
+  name: "get_users",
+  description: "List Gong users (paginated) with optional name filter applied client-side.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      name_filter: { type: "string", description: "Optional case-insensitive substring filter on user name" }
+    }
   }
 };
 
@@ -206,18 +341,28 @@ function isGongListCallsArgs(args: unknown): args is GongListCallsArgs {
 }
 
 function isGongRetrieveTranscriptsArgs(args: unknown): args is GongRetrieveTranscriptsArgs {
-  return (
-    typeof args === "object" &&
-    args !== null &&
-    "callIds" in args &&
-    Array.isArray((args as GongRetrieveTranscriptsArgs).callIds) &&
-    (args as GongRetrieveTranscriptsArgs).callIds.every(id => typeof id === "string")
+  if (typeof args !== "object" || args === null || !("callIds" in args)) return false;
+  const val = (args as GongRetrieveTranscriptsArgs).callIds;
+  if (typeof val === "string") return true;
+  return Array.isArray(val) && val.every((id) => typeof id === "string");
+}
+
+function isListCallsExtensiveArgs(args: unknown): args is GongListCallsExtensiveArgs {
+  if (typeof args !== "object" || args === null) return false;
+  const obj = args as GongListCallsExtensiveArgs;
+  const allStrings = ["start_date", "end_date", "user_id", "text"].every(
+    (k) => !(k in obj) || typeof (obj as Record<string, unknown>)[k] === "string"
   );
+  const userIds = obj.user_ids ?? obj.userIds;
+  const arraysValid =
+    userIds === undefined ||
+    (Array.isArray(userIds) && userIds.every((u) => typeof u === "string"));
+  return allStrings && arraysValid;
 }
 
 // Tool handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [LIST_CALLS_TOOL, RETRIEVE_TRANSCRIPTS_TOOL],
+  tools: [LIST_CALLS_TOOL, LIST_CALLS_EXTENSIVE_TOOL, GET_USERS_TOOL, RETRIEVE_TRANSCRIPTS_TOOL],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name: string; arguments?: unknown } }) => {
@@ -244,12 +389,135 @@ server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name
         };
       }
 
+      case "list_calls_extensive": {
+        if (!isListCallsExtensiveArgs(args)) {
+          throw new Error("Invalid arguments for list_calls_extensive");
+        }
+        const userIdsExplicit = args.user_ids || args.userIds;
+        const userIds = userIdsExplicit && userIdsExplicit.length > 0
+          ? userIdsExplicit
+          : args.user_id
+            ? [args.user_id]
+            : [await getOrResolveMyUserId()];
+
+        const filter: Record<string, unknown> = {
+          fromDateTime: args.start_date,
+          toDateTime: args.end_date,
+          userIds,
+        };
+        if (args.text) {
+          filter.text = args.text;
+        }
+
+        const allCalls: Array<Record<string, unknown>> = [];
+        let cursor: string | undefined;
+        let safety = 0;
+        do {
+          const response = await gongClient.listCallsExtensive(filter, cursor);
+          if (response.calls) {
+            allCalls.push(...response.calls);
+          }
+          cursor = response.records?.cursor;
+          safety += 1;
+        } while (cursor && safety < 50); // prevent runaway pagination
+
+        const normalized = allCalls.map((call) => {
+          const participants = Array.isArray((call as Record<string, unknown>).participants)
+            ? (call as Record<string, unknown>).participants as Array<Record<string, unknown>>
+            : [];
+          const started =
+            (call as Record<string, unknown>).started ||
+            (call as Record<string, unknown>).startTime ||
+            (call as Record<string, unknown>).startedAt;
+          const ended =
+            (call as Record<string, unknown>).ended ||
+            (call as Record<string, unknown>).endTime ||
+            (call as Record<string, unknown>).endedAt;
+          return {
+            callId: (call as Record<string, unknown>).id,
+            title: (call as Record<string, unknown>).title || (call as Record<string, unknown>).subject,
+            startedAt: started,
+            endedAt: ended,
+            duration: (call as Record<string, unknown>).duration,
+            participants: participants.map((p) => ({
+              role: (p as Record<string, unknown>).role || (p as Record<string, unknown>).type,
+              displayName: (p as Record<string, unknown>).displayName || (p as Record<string, unknown>).name,
+              id: (p as Record<string, unknown>).id || (p as Record<string, unknown>).userId,
+            })),
+            gongUrl:
+              (call as Record<string, unknown>).url ||
+              ((call as Record<string, unknown>).id
+                ? `https://app.gong.io/call?id=${(call as Record<string, unknown>).id}`
+                : undefined),
+          };
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  count: normalized.length,
+                  calls: normalized,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+          isError: false,
+        };
+      }
+
+      case "get_users": {
+        const nameFilter =
+          typeof args === "object" && args !== null && "name_filter" in args
+            ? (args as { name_filter?: unknown }).name_filter
+            : undefined;
+        const filterStr = typeof nameFilter === "string" ? nameFilter.toLowerCase() : undefined;
+        let cursor: string | undefined;
+        const users: GongUser[] = [];
+        let safety = 0;
+        do {
+          const resp = await gongClient.getUsers(cursor);
+          users.push(...(resp.users || []));
+          cursor = resp.records?.cursor;
+          safety += 1;
+        } while (cursor && safety < 50);
+
+        const filtered = filterStr
+          ? users.filter((u) => {
+              const composite = `${u.firstName || ""} ${u.lastName || ""}`.trim().toLowerCase();
+              const alt = (u.fullName || u.name || "").toLowerCase();
+              return composite.includes(filterStr) || alt.includes(filterStr);
+            })
+          : users;
+
+        const simplified = filtered.map((u) => ({
+          userId: u.id,
+          fullName: u.fullName ?? u.name ?? `${u.firstName ?? ""} ${u.lastName ?? ""}`.trim() ?? null,
+          email: u.emailAddress ?? u.email ?? null,
+        }));
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ count: simplified.length, users: simplified }, null, 2),
+            },
+          ],
+          isError: false,
+        };
+      }
+
       case "retrieve_transcripts": {
         if (!isGongRetrieveTranscriptsArgs(args)) {
           throw new Error("Invalid arguments for retrieve_transcripts");
         }
         const { callIds } = args;
-        const response = await gongClient.retrieveTranscripts(callIds);
+        const idsArray = Array.isArray(callIds) ? callIds : [callIds];
+        const response = await gongClient.retrieveTranscripts(idsArray);
         return {
           content: [{ 
             type: "text", 

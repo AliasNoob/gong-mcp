@@ -8,6 +8,7 @@ A Model Context Protocol (MCP) server that provides access to Gong's API for ret
 - Retrieve detailed transcripts for specific calls
 - Secure authentication using Gong's API credentials
 - Standardized MCP interface for easy integration with Claude
+- Extended tools for detailed calls and user lookup
 
 ## Prerequisites
 
@@ -36,29 +37,31 @@ Build the container:
 docker build -t gong-mcp .
 ```
 
-## Configuring Claude
+## Configuring MCP Clients (Claude, Codex VS Code, others)
 
-1. Open Claude Desktop settings
-2. Navigate to the MCP Servers section
-3. Add a new server with the following configuration:
+Configure the Docker MCP gateway to run this server. Example entry (Claude Desktop / Codex / VS Code MCP):
 
 ```json
 {
   "command": "docker",
   "args": [
     "run",
-    "-it",
+    "-i",
     "--rm",
     "gong-mcp"
   ],
   "env": {
     "GONG_ACCESS_KEY": "your_access_key_here",
-    "GONG_ACCESS_SECRET": "your_access_secret_here"
+    "GONG_ACCESS_SECRET": "your_access_secret_here",
+    "GONG_USER_FULL_NAME": "Your Gong Full Name"
   }
 }
 ```
 
-4. Replace the placeholder credentials with your actual Gong API credentials from your `.env` file
+Notes:
+- Use `-i` (no TTY) for stdio MCP.
+- Set env vars in the client config or `.env` (git-ignored). Keep secrets local.
+- Codex/VS Code: ensure your Docker MCP gateway is connected; restart the client after updating envs.
 
 ## Available Tools
 
@@ -85,6 +88,18 @@ Retrieves a list of Gong calls with optional date range filtering.
   }
 }
 ```
+
+### List Calls Extensive
+
+Retrieves detailed Gong calls via `/v2/calls/extensive` with optional date range, user filter (defaults to `GONG_USER_FULL_NAME`), and text filter. Includes participants, timestamps, duration, title, and Gong URL when available.
+
+Inputs: `start_date`, `end_date`, `user_id` or `user_ids/userIds` array, `text` (customer/search text).
+
+Returns: callId, title, started/ended timestamps, duration, participants (role/displayName/id), and a Gong URL.
+
+### Get Users
+
+Lists Gong users with optional `name_filter` (case-insensitive substring, applied locally). Returns userId, fullName, email.
 
 ### Retrieve Transcripts
 
