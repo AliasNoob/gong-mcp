@@ -53,7 +53,8 @@ Configure the Docker MCP gateway to run this server. Example entry (Claude Deskt
   "env": {
     "GONG_ACCESS_KEY": "your_access_key_here",
     "GONG_ACCESS_SECRET": "your_access_secret_here",
-    "GONG_USER_FULL_NAME": "Your Gong Full Name"
+    "GONG_USER_FULL_NAME": "Your Gong Full Name",
+    "GONG_USER_ID": "optional_cached_user_id"
   }
 }
 ```
@@ -61,6 +62,7 @@ Configure the Docker MCP gateway to run this server. Example entry (Claude Deskt
 Notes:
 - Use `-i` (no TTY) for stdio MCP.
 - Set env vars in the client config or `.env` (git-ignored). Keep secrets local.
+- If `GONG_USER_ID` is not provided, the server resolves it once from `GONG_USER_FULL_NAME` and writes it to `.env` so subsequent runs skip the lookup.
 - Codex/VS Code: ensure your Docker MCP gateway is connected; restart the client after updating envs.
 
 ## Available Tools
@@ -96,6 +98,30 @@ Retrieves detailed Gong calls via `/v2/calls/extensive` with optional date range
 Inputs: `start_date`, `end_date`, `user_id` or `user_ids/userIds` array, `text` (customer/search text).
 
 Returns: callId, title, started/ended timestamps, duration, participants (role/displayName/id), and a Gong URL.
+
+### Activity Day By Day
+
+Retrieves daily activity for users in a date range via `/v2/stats/activity/day-by-day` (returns attended/hosted call IDs and other stats).
+
+Inputs: `fromDate` (YYYY-MM-DD inclusive), `toDate` (YYYY-MM-DD exclusive), optional `userIds` (defaults to resolved user), optional `cursor`.
+
+Returns: Gong activity records including `callsAttended`, `callsAsHost`, and other per-day stats.
+
+### My Calls Range
+
+Lists calls you hosted or attended for a date range using day-by-day activity and enriches with call details (host name, URL).
+
+Inputs: `fromDate` (YYYY-MM-DD inclusive), `toDate` (YYYY-MM-DD exclusive), optional `daysBack` (defaults to 5 when dates are omitted), optional `userIds` (defaults to resolved user).
+
+Returns: callId, title, start time, duration, host name/id, Gong URL, plus a formatted summary list.
+
+### My Calls Today
+
+Lists today's calls for the default user using day-by-day activity (accurate attendance) and enriches each call with call details. Uses a cached `GONG_USER_ID` (auto-resolved once from `GONG_USER_FULL_NAME`).
+
+Inputs: none.
+
+Returns: date label, count, and a compact list of today's calls (callId, title, start time, duration, Gong URL).
 
 ### Get Users
 
